@@ -1,0 +1,13 @@
+{
+  "name": "@xiaoshuren/queue-bullmq",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@xiaoshuren/workers": "workspace:*",
+    "bullmq": "^5.58.5",
+    "ioredis": "^5.7.0"
+  }
+}

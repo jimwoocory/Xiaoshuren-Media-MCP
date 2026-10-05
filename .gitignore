@@ -3,6 +3,8 @@ dist/
 .corepack/
 .pnpm-store/
 *.tsbuildinfo
+__pycache__/
+*.pyc
 error.log
 .env
 .env.*

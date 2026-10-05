@@ -30,7 +30,8 @@ describe("P0-01 core integration", () => {
     store.addWorkspace({ id: "ws-a", tenantId: "tenant-a", name: "A", status: "active" }, ["subject-a"]);
     const job = await new JobService(store).create(auth, { workspaceId: "ws-a", idempotencyKey: "u".repeat(16), request, modelId: "image-v1" });
     const provider = new FakeProvider();
-    const execution = { tenantId: "tenant-a", workspaceId: "ws-a", jobId: job.jobId, providerExecutionId: "pe-1", providerRequestKey: "request-1" };
+    const persistedExecution = store.providerExecutions[0];
+    const execution = { tenantId: "tenant-a", workspaceId: "ws-a", jobId: job.jobId, providerExecutionId: persistedExecution.id, providerRequestKey: persistedExecution.providerRequestKey, providerModelId: persistedExecution.providerModelId };
     const service = new ProviderExecutionService(store, provider);
     await service.submit(execution, { scenario: "unknown" });
     expect((await store.findJob(job.jobId))?.status).toBe("reconciling");

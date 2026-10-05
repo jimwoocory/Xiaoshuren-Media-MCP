@@ -1,9 +1,17 @@
 {
   "files": [],
   "references": [
+    { "path": "packages/asset-service" },
     { "path": "packages/contracts" },
     { "path": "packages/media-core" },
     { "path": "packages/persistence" },
-    { "path": "packages/fake-provider" }
+    { "path": "packages/fake-provider" },
+    { "path": "packages/provider-chatgpt-web" },
+    { "path": "packages/provider-dreamina-cli" },
+    { "path": "packages/provider-replicate" },
+    { "path": "packages/queue-bullmq" },
+    { "path": "packages/security" },
+    { "path": "packages/storage" },
+    { "path": "packages/workers" }
   ]
 }
