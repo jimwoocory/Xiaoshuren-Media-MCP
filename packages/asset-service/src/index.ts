@@ -139,6 +139,14 @@ export class AssetUploadService {
       sha256: observed.sha256,
     });
   }
+
+  async confirmByAsset(auth: AuthContext, assetId: string): Promise<Asset> {
+    const session = await this.store.findUploadSessionByAsset(auth, assetId);
+    if (!session || session.assetId !== assetId) {
+      throw new DomainError("NOT_FOUND", "Resource not found");
+    }
+    return this.confirm(auth, session.id);
+  }
 }
 
 export interface ImportFetcher {
@@ -199,5 +207,107 @@ export class UrlImportService {
 
     await this.store.persistImportedAsset(auth, asset);
     return asset;
+  }
+}
+
+export class InlineAssetService {
+  constructor(
+    private readonly store: AssetUploadStore,
+    private readonly objectStore: ObjectStore,
+    private readonly maxBytes = 10 * 1024 * 1024,
+  ) {}
+
+  async create(auth: AuthContext, input: {
+    workspaceId?: string;
+    filename: string;
+    mimeType: string;
+    base64: string;
+  }): Promise<Asset> {
+    const workspace = await this.store.authorize(auth, input.workspaceId);
+    let body: Uint8Array;
+    try {
+      body = new Uint8Array(Buffer.from(input.base64, "base64"));
+    } catch {
+      throw new DomainError("ASSET_REJECTED", "Inline base64 is invalid");
+    }
+    if (!body.byteLength || body.byteLength > this.maxBytes) {
+      throw new DomainError("ASSET_REJECTED", "Inline asset size is outside the allowed range");
+    }
+
+    const detectedMime = detectMediaMime(body);
+    const declaredMime = normalizeMime(input.mimeType);
+    if (!detectedMime || !ALLOWED_MEDIA_TYPES.has(detectedMime) || detectedMime !== declaredMime) {
+      throw new DomainError("ASSET_REJECTED", "Inline media type does not match its content signature");
+    }
+
+    const assetId = randomUUID();
+    const sha256 = createHash("sha256").update(body).digest("hex");
+    const key = [
+      auth.tenantId,
+      workspace.id,
+      "inline",
+      `${assetId}.${extensionForMime(detectedMime)}`,
+    ].map(part => encodeURIComponent(part)).join("/");
+    const stored = await this.objectStore.putObject({
+      key,
+      body,
+      contentType: detectedMime,
+      sha256,
+    });
+    const now = new Date();
+    const asset: Asset = {
+      id: assetId,
+      tenantId: auth.tenantId,
+      workspaceId: workspace.id,
+      kind: "input",
+      status: "ready",
+      storageBucket: stored.bucket,
+      storageKey: stored.key,
+      sha256,
+      mimeType: detectedMime,
+      byteSize: body.byteLength,
+      createdAt: now,
+      updatedAt: now,
+    };
+    await this.store.persistImportedAsset(auth, asset);
+    return asset;
+  }
+}
+
+export class AssetReadService {
+  constructor(
+    private readonly store: AssetUploadStore,
+    private readonly objectStore: ObjectStore,
+    private readonly readUrlExpiresInSeconds = 10 * 60,
+  ) {}
+
+  async get(auth: AuthContext, input: {
+    workspaceId?: string;
+    assetId: string;
+    includeAccessUrl?: boolean;
+  }): Promise<{ asset: Asset; accessUrl?: string; accessUrlExpiresAt?: Date }> {
+    const asset = await this.store.findAsset(auth, input.assetId);
+    if (!asset) throw new DomainError("NOT_FOUND", "Resource not found");
+    const workspace = await this.store.authorize(auth, input.workspaceId ?? asset.workspaceId);
+    if (asset.tenantId !== auth.tenantId || asset.workspaceId !== workspace.id) {
+      throw new DomainError("NOT_FOUND", "Resource not found");
+    }
+    if (!input.includeAccessUrl) return { asset };
+    if (asset.status !== "ready" || !asset.storageKey) {
+      throw new DomainError("ASSET_NOT_READY", "Asset is not ready for access");
+    }
+    const signed = await this.objectStore.createSignedReadUrl({
+      key: asset.storageKey,
+      expiresInSeconds: this.readUrlExpiresInSeconds,
+    });
+    return {
+      asset,
+      accessUrl: signed.url,
+      accessUrlExpiresAt: signed.expiresAt,
+    };
+  }
+
+  async listBySourceJob(auth: AuthContext, jobId: string): Promise<Asset[]> {
+    return this.store.findAssetsBySourceJob(auth, jobId);
   }
 }

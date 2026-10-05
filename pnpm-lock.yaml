@@ -38,6 +38,15 @@ importers:
       '@modelcontextprotocol/sdk':
         specifier: 1.32.1
         version: 1.32.1(zod@4.6.5)
+      '@xiaoshuren/asset-service':
+        specifier: workspace:^
+        version: link:../../packages/asset-service
+      '@xiaoshuren/contracts':
+        specifier: workspace:^
+        version: link:../../packages/contracts
+      '@xiaoshuren/media-core':
+        specifier: workspace:^
+        version: link:../../packages/media-core
       jose:
         specifier: 6.2.12
         version: 6.2.12
