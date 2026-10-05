@@ -1,6 +1,7 @@
 {
   "files": [],
   "references": [
+    { "path": "apps/mcp-server" },
     { "path": "packages/asset-service" },
     { "path": "packages/contracts" },
     { "path": "packages/media-core" },
