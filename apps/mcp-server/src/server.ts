@@ -16,9 +16,13 @@ const errorResult = (error: unknown) => ({
       type: "text" as const,
       text: JSON.stringify({
         error: {
-          code: "INTERNAL_ERROR",
+          code: typeof (error as { code?: unknown })?.code === "string"
+            ? (error as { code: string }).code
+            : "INTERNAL_ERROR",
           message: error instanceof Error ? error.message : "Unknown MCP tool error",
-          retryable: false,
+          retryable: typeof (error as { retryable?: unknown })?.retryable === "boolean"
+            ? (error as { retryable: boolean }).retryable
+            : false,
         },
       }),
     },

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { Asset, Audit, AuthContext, DomainError, IdempotencyRecord, Job, JobStatus, Outbox, ProviderAdapter, ProviderExecution, ProviderExecutionContext, ProviderStatusResult, UploadSession, Workspace, stableHash } from "@xiaoshuren/contracts";
+import { Asset, Audit, AuthContext, DomainError, IdempotencyRecord, Job, JobStatus, ModelCatalogEntry, Outbox, ProviderAdapter, ProviderExecution, ProviderExecutionContext, ProviderStatusResult, Quote, UploadSession, Workspace, stableHash } from "@xiaoshuren/contracts";
 export { DomainError } from "@xiaoshuren/contracts";
 
 const transitions: Record<JobStatus, readonly JobStatus[]> = {
@@ -7,7 +7,7 @@ const transitions: Record<JobStatus, readonly JobStatus[]> = {
 };
 export const transitionJob = (from: JobStatus, to: JobStatus): JobStatus => { if (!transitions[from].includes(to)) throw new DomainError("INVALID_JOB_TRANSITION", `Cannot transition job from ${from} to ${to}`); return to; };
 
-export type CreateJobInput = { workspaceId?: string; idempotencyKey: string; request: Record<string, unknown>; modelId: string; quoteId?: string; kind?: "image" | "video"; providerId?: string; providerModelId?: string; requestId?: string };
+export type CreateJobInput = { workspaceId?: string; idempotencyKey: string; idempotencyToolName?: string; request: Record<string, unknown>; modelId: string; quoteId?: string; kind?: "image" | "video"; providerId?: string; providerModelId?: string; requestId?: string };
 export type CreateJobResult = { jobId: string; status: "queued" };
 export type JobStore = {
   transaction<T>(fn: (store: JobStore) => T | Promise<T>): Promise<T>;
@@ -41,26 +41,50 @@ export type AssetUploadStore = {
   authorize(auth: AuthContext, workspaceId?: string): Promise<Workspace>;
   createUploadSession(auth: AuthContext, asset: Asset, session: UploadSession): Promise<void>;
   findUploadSession(auth: AuthContext, sessionId: string): Promise<UploadSession | undefined>;
+  findUploadSessionByAsset(auth: AuthContext, assetId: string): Promise<UploadSession | undefined>;
   findAsset(auth: AuthContext, assetId: string): Promise<Asset | undefined>;
+  findAssetsBySourceJob(auth: AuthContext, jobId: string): Promise<Asset[]>;
   completeUploadSession(auth: AuthContext, sessionId: string, observed: { byteSize: number; contentType: string; sha256?: string }): Promise<Asset>;
   persistImportedAsset(auth: AuthContext, asset: Asset): Promise<void>;
 };
 
-export class InMemoryMediaStore implements JobStore {
-  workspaces: Workspace[] = []; jobs: Job[] = []; providerExecutions: ProviderExecution[] = []; outbox: Outbox[] = []; audits: Audit[] = []; idempotency: IdempotencyRecord[] = []; private members = new Map<string, Set<string>>();
+export type QuoteStore = {
+  transaction<T>(fn: (store: QuoteStore) => T | Promise<T>): Promise<T>;
+  authorize(auth: AuthContext, workspaceId?: string): Promise<Workspace>;
+  findIdempotency(auth: AuthContext, tool: string, key: string): Promise<IdempotencyRecord | undefined>;
+  findQuote(auth: AuthContext, quoteId: string): Promise<Quote | undefined>;
+  persistQuote(quote: Quote, record: IdempotencyRecord): Promise<IdempotencyRecord | undefined>;
+  updateQuote(quote: Quote): Promise<void>;
+};
+
+export type IdempotencyStore = {
+  findIdempotency(auth: AuthContext, tool: string, key: string): Promise<IdempotencyRecord | undefined>;
+  reserveIdempotency(record: IdempotencyRecord): Promise<IdempotencyRecord>;
+  completeIdempotency(recordId: string, response: Record<string, unknown>, resourceType: string, resourceId: string): Promise<void>;
+  deleteIdempotency(recordId: string): Promise<void>;
+};
+
+export class InMemoryMediaStore implements JobStore, QuoteStore, IdempotencyStore {
+  workspaces: Workspace[] = []; jobs: Job[] = []; quotes: Quote[] = []; providerExecutions: ProviderExecution[] = []; outbox: Outbox[] = []; audits: Audit[] = []; idempotency: IdempotencyRecord[] = []; private members = new Map<string, Set<string>>();
   addWorkspace(workspace: Workspace, subjects: string[]) { this.workspaces.push(workspace); this.members.set(workspace.id, new Set(subjects)); }
-  async transaction<T>(fn: (store: JobStore) => T | Promise<T>): Promise<T> { const snapshot = structuredClone({ jobs: this.jobs, providerExecutions: this.providerExecutions, outbox: this.outbox, audits: this.audits, idempotency: this.idempotency }); try { return await fn(this); } catch (error) { this.jobs = snapshot.jobs; this.providerExecutions = snapshot.providerExecutions; this.outbox = snapshot.outbox; this.audits = snapshot.audits; this.idempotency = snapshot.idempotency; throw error; } }
+  async transaction<T>(fn: (store: InMemoryMediaStore) => T | Promise<T>): Promise<T> { const snapshot = structuredClone({ jobs: this.jobs, quotes: this.quotes, providerExecutions: this.providerExecutions, outbox: this.outbox, audits: this.audits, idempotency: this.idempotency }); try { return await fn(this); } catch (error) { this.jobs = snapshot.jobs; this.quotes = snapshot.quotes; this.providerExecutions = snapshot.providerExecutions; this.outbox = snapshot.outbox; this.audits = snapshot.audits; this.idempotency = snapshot.idempotency; throw error; } }
   async authorize(auth: AuthContext, workspaceId?: string): Promise<Workspace> { const id = workspaceId ?? auth.defaultWorkspaceId; const workspace = this.workspaces.find(w => w.id === id && w.tenantId === auth.tenantId && w.status === "active" && this.members.get(w.id)?.has(auth.subjectId)); if (!workspace) throw new DomainError("NOT_FOUND", "Resource not found"); return workspace; }
   async findIdempotency(auth: AuthContext, tool: string, key: string): Promise<IdempotencyRecord | undefined> { return this.idempotency.find(r => r.tenantId === auth.tenantId && r.subjectId === auth.subjectId && r.toolName === tool && r.idempotencyKey === key); }
   async persistCreatedJob(job: Job, execution: ProviderExecution, outbox: Outbox, audit: Audit, record: IdempotencyRecord): Promise<IdempotencyRecord | undefined> { const existing = this.idempotency.find(candidate => candidate.tenantId === record.tenantId && candidate.subjectId === record.subjectId && candidate.toolName === record.toolName && candidate.idempotencyKey === record.idempotencyKey); if (existing) return existing; this.jobs.push(job); this.providerExecutions.push(execution); this.outbox.push(outbox); this.audits.push(audit); this.idempotency.push(record); return undefined; }
   async findJob(id: string): Promise<Job | undefined> { return this.jobs.find(j => j.id === id); } async updateJob(job: Job): Promise<void> { const i = this.jobs.findIndex(j => j.id === job.id); if (i < 0) throw new DomainError("NOT_FOUND", "Resource not found"); this.jobs[i] = job; }
   async findProviderExecution(id: string): Promise<ProviderExecution | undefined> { return this.providerExecutions.find(execution => execution.id === id); }
   async updateProviderExecution(execution: ProviderExecution): Promise<void> { const i = this.providerExecutions.findIndex(candidate => candidate.id === execution.id); if (i < 0) throw new DomainError("NOT_FOUND", "Resource not found"); this.providerExecutions[i] = execution; }
+  async findQuote(auth: AuthContext, quoteId: string): Promise<Quote | undefined> { return this.quotes.find(q => q.id === quoteId && q.tenantId === auth.tenantId && q.subjectId === auth.subjectId); }
+  async persistQuote(quote: Quote, record: IdempotencyRecord): Promise<IdempotencyRecord | undefined> { const existing = this.idempotency.find(candidate => candidate.tenantId === record.tenantId && candidate.subjectId === record.subjectId && candidate.toolName === record.toolName && candidate.idempotencyKey === record.idempotencyKey); if (existing) return existing; this.quotes.push(quote); this.idempotency.push(record); return undefined; }
+  async updateQuote(quote: Quote): Promise<void> { const i = this.quotes.findIndex(candidate => candidate.id === quote.id); if (i < 0) throw new DomainError("NOT_FOUND", "Resource not found"); this.quotes[i] = quote; }
+  async reserveIdempotency(record: IdempotencyRecord): Promise<IdempotencyRecord> { const existing = this.idempotency.find(candidate => candidate.tenantId === record.tenantId && candidate.subjectId === record.subjectId && candidate.toolName === record.toolName && candidate.idempotencyKey === record.idempotencyKey); if (existing) return existing; this.idempotency.push(record); return record; }
+  async completeIdempotency(recordId: string, response: Record<string, unknown>, resourceType: string, resourceId: string): Promise<void> { const record = this.idempotency.find(candidate => candidate.id === recordId); if (!record) throw new DomainError("INTERNAL_ERROR", "Idempotency reservation not found"); record.responseSnapshot = structuredClone(response); record.resourceType = resourceType; record.resourceId = resourceId; }
+  async deleteIdempotency(recordId: string): Promise<void> { this.idempotency = this.idempotency.filter(candidate => candidate.id !== recordId); }
 }
 
 export class JobService {
   constructor(private readonly store: JobStore) {}
-  async create(auth: AuthContext, input: CreateJobInput): Promise<CreateJobResult> { return this.store.transaction(async store => { if (input.idempotencyKey.length < 16 || input.idempotencyKey.length > 128) throw new DomainError("VALIDATION_ERROR", "idempotency key must be 16..128 characters"); const workspace = await store.authorize(auth, input.workspaceId); const requestHash = stableHash({ workspaceId: workspace.id, modelId: input.modelId, request: input.request }); const existing = await store.findIdempotency(auth, "generate", input.idempotencyKey); if (existing) { if (existing.requestHash !== requestHash) throw new DomainError("IDEMPOTENCY_CONFLICT", "idempotency key was already used for another request"); return existing.responseSnapshot as CreateJobResult; } const now = new Date(); const jobId = randomUUID(); const result: CreateJobResult = { jobId, status: "queued" }; const job: Job = { id: jobId, tenantId: auth.tenantId, subjectId: auth.subjectId, workspaceId: workspace.id, quoteId: input.quoteId, kind: input.kind ?? "image", publicModelId: input.modelId, requestHash, frozenRequest: input.request, status: "queued", version: 1, createdAt: now, updatedAt: now }; const execution: ProviderExecution = { id: randomUUID(), jobId, providerId: input.providerId ?? "fake", providerModelId: input.providerModelId ?? input.modelId, providerRequestKey: randomUUID(), status: "queued", submissionAttempts: 0, createdAt: now, updatedAt: now }; const outbox: Outbox = { id: randomUUID(), aggregateType: "job", aggregateId: jobId, eventType: "job.submit.requested", payload: { jobId, providerExecutionId: execution.id }, availableAt: now, createdAt: now }; const audit: Audit = { id: randomUUID(), tenantId: auth.tenantId, subjectId: auth.subjectId, workspaceId: workspace.id, action: "job.created", targetType: "job", targetId: jobId, requestId: input.requestId ?? randomUUID(), metadataRedacted: { kind: job.kind, publicModelId: job.publicModelId }, createdAt: now }; const record: IdempotencyRecord = { id: randomUUID(), tenantId: auth.tenantId, subjectId: auth.subjectId, toolName: "generate", idempotencyKey: input.idempotencyKey, requestHash, responseSnapshot: result, resourceType: "job", resourceId: jobId, createdAt: now }; const concurrentRecord = await store.persistCreatedJob(job, execution, outbox, audit, record); if (concurrentRecord) { if (concurrentRecord.requestHash !== requestHash) throw new DomainError("IDEMPOTENCY_CONFLICT", "idempotency key was already used for another request"); return concurrentRecord.responseSnapshot as CreateJobResult; } return result; }); }
+  async create(auth: AuthContext, input: CreateJobInput): Promise<CreateJobResult> { return this.store.transaction(async store => { if (input.idempotencyKey.length < 16 || input.idempotencyKey.length > 128) throw new DomainError("VALIDATION_ERROR", "idempotency key must be 16..128 characters"); const workspace = await store.authorize(auth, input.workspaceId); const requestHash = stableHash({ workspaceId: workspace.id, modelId: input.modelId, request: input.request }); const toolName = input.idempotencyToolName ?? "generate"; const existing = await store.findIdempotency(auth, toolName, input.idempotencyKey); if (existing) { if (existing.requestHash !== requestHash) throw new DomainError("IDEMPOTENCY_CONFLICT", "idempotency key was already used for another request"); return existing.responseSnapshot as CreateJobResult; } const now = new Date(); const jobId = randomUUID(); const result: CreateJobResult = { jobId, status: "queued" }; const job: Job = { id: jobId, tenantId: auth.tenantId, subjectId: auth.subjectId, workspaceId: workspace.id, quoteId: input.quoteId, kind: input.kind ?? "image", publicModelId: input.modelId, requestHash, frozenRequest: input.request, status: "queued", version: 1, createdAt: now, updatedAt: now }; const execution: ProviderExecution = { id: randomUUID(), jobId, providerId: input.providerId ?? "fake", providerModelId: input.providerModelId ?? input.modelId, providerRequestKey: randomUUID(), status: "queued", submissionAttempts: 0, createdAt: now, updatedAt: now }; const outbox: Outbox = { id: randomUUID(), aggregateType: "job", aggregateId: jobId, eventType: "job.submit.requested", payload: { jobId, providerExecutionId: execution.id }, availableAt: now, createdAt: now }; const audit: Audit = { id: randomUUID(), tenantId: auth.tenantId, subjectId: auth.subjectId, workspaceId: workspace.id, action: "job.created", targetType: "job", targetId: jobId, requestId: input.requestId ?? randomUUID(), metadataRedacted: { kind: job.kind, publicModelId: job.publicModelId }, createdAt: now }; const record: IdempotencyRecord = { id: randomUUID(), tenantId: auth.tenantId, subjectId: auth.subjectId, toolName, idempotencyKey: input.idempotencyKey, requestHash, responseSnapshot: result, resourceType: "job", resourceId: jobId, createdAt: now }; const concurrentRecord = await store.persistCreatedJob(job, execution, outbox, audit, record); if (concurrentRecord) { if (concurrentRecord.requestHash !== requestHash) throw new DomainError("IDEMPOTENCY_CONFLICT", "idempotency key was already used for another request"); return concurrentRecord.responseSnapshot as CreateJobResult; } return result; }); }
 }
 
 export class ProviderExecutionService {
@@ -154,3 +178,5 @@ export class ProviderExecutionService {
     return observation;
   }
 }
+
+export * from "./services.js";

@@ -1,8 +1,8 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Pool, PoolClient } from "pg";
-import { Asset, Audit, AuthContext, DomainError, IdempotencyRecord, Job, Outbox, ProviderExecution, UploadSession, Workspace } from "@xiaoshuren/contracts";
-import { AssetCompletionStore, AssetUploadStore, JobStore, WebhookEventRecord, WebhookEventStore, transitionJob } from "@xiaoshuren/media-core";
+import { Asset, Audit, AuthContext, DomainError, IdempotencyRecord, Job, ModelCatalogEntry, Outbox, ProviderExecution, Quote, UploadSession, Workspace } from "@xiaoshuren/contracts";
+import { AssetCompletionStore, AssetUploadStore, IdempotencyStore, JobStore, ModelCatalogReader, QuoteStore, WebhookEventRecord, WebhookEventStore, transitionJob } from "@xiaoshuren/media-core";
 
 export const migrate = async (pool: Pick<Pool, "query">): Promise<void> => {
   const migrationsDir = join(import.meta.dirname, "migrations");
@@ -17,7 +17,7 @@ export const migrate = async (pool: Pick<Pool, "query">): Promise<void> => {
   }
 };
 
-export class PostgresJobRepository implements JobStore, WebhookEventStore, AssetCompletionStore, AssetUploadStore {
+export class PostgresJobRepository implements JobStore, WebhookEventStore, AssetCompletionStore, AssetUploadStore, IdempotencyStore {
   constructor(private readonly pool: Pool, private readonly client?: PoolClient) {}
 
   private q(sql: string, values: unknown[] = []) { return (this.client ?? this.pool).query(sql, values); }
@@ -57,6 +57,32 @@ export class PostgresJobRepository implements JobStore, WebhookEventStore, Asset
     if (!result.rowCount) return undefined;
     const row = result.rows[0];
     return { id: row.id, tenantId: row.tenant_id, subjectId: row.subject_id, toolName: row.tool_name, idempotencyKey: row.idempotency_key, requestHash: row.request_hash, responseSnapshot: row.response_snapshot_json, resourceType: row.resource_type, resourceId: row.resource_id, createdAt: row.created_at };
+  }
+
+  async reserveIdempotency(record: IdempotencyRecord): Promise<IdempotencyRecord> {
+    await this.q(
+      "INSERT INTO idempotency_records(id,tenant_id,subject_id,tool_name,idempotency_key,request_hash,response_snapshot_json,resource_type,resource_id,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (tenant_id,subject_id,tool_name,idempotency_key) DO NOTHING",
+      [record.id, record.tenantId, record.subjectId, record.toolName, record.idempotencyKey, record.requestHash, record.responseSnapshot, record.resourceType, record.resourceId, record.createdAt],
+    );
+    const persisted = await this.findIdempotency(
+      { tenantId: record.tenantId, subjectId: record.subjectId, clientId: "internal", scopes: [] },
+      record.toolName,
+      record.idempotencyKey,
+    );
+    if (!persisted) throw new DomainError("INTERNAL_ERROR", "Idempotency reservation could not be persisted");
+    return persisted;
+  }
+
+  async completeIdempotency(recordId: string, response: Record<string, unknown>, resourceType: string, resourceId: string): Promise<void> {
+    const result = await this.q(
+      "UPDATE idempotency_records SET response_snapshot_json=$1,resource_type=$2,resource_id=$3 WHERE id=$4",
+      [response, resourceType, resourceId, recordId],
+    );
+    if (!result.rowCount) throw new DomainError("INTERNAL_ERROR", "Idempotency reservation not found");
+  }
+
+  async deleteIdempotency(recordId: string): Promise<void> {
+    await this.q("DELETE FROM idempotency_records WHERE id=$1", [recordId]);
   }
 
   async persistCreatedJob(job: Job, execution: ProviderExecution, outbox: Outbox, audit: Audit, record: IdempotencyRecord): Promise<IdempotencyRecord | undefined> {
@@ -240,6 +266,29 @@ export class PostgresJobRepository implements JobStore, WebhookEventStore, Asset
     };
   }
 
+  async findUploadSessionByAsset(auth: AuthContext, assetId: string): Promise<UploadSession | undefined> {
+    const result = await this.q(
+      "SELECT s.id,s.tenant_id,s.subject_id,s.workspace_id,s.asset_id,s.storage_key,s.mime_type,s.expected_byte_size,s.status,s.expires_at,s.created_at,s.completed_at FROM upload_sessions s JOIN workspace_members m ON m.workspace_id=s.workspace_id WHERE s.asset_id=$1 AND s.tenant_id=$2 AND s.subject_id=$3 AND m.subject_id=$3 ORDER BY s.created_at DESC LIMIT 1",
+      [assetId, auth.tenantId, auth.subjectId],
+    );
+    if (!result.rowCount) return undefined;
+    const row = result.rows[0];
+    return {
+      id: row.id,
+      tenantId: row.tenant_id,
+      subjectId: row.subject_id,
+      workspaceId: row.workspace_id,
+      assetId: row.asset_id,
+      storageKey: row.storage_key,
+      mimeType: row.mime_type,
+      expectedByteSize: Number(row.expected_byte_size),
+      status: row.status,
+      expiresAt: row.expires_at,
+      createdAt: row.created_at,
+      completedAt: row.completed_at ?? undefined,
+    };
+  }
+
   async findAsset(auth: AuthContext, assetId: string): Promise<Asset | undefined> {
     const result = await this.q(
       "SELECT a.id,a.tenant_id,a.workspace_id,a.source_job_id,a.kind,a.status,a.storage_bucket,a.storage_key,a.sha256,a.mime_type,a.byte_size,a.created_at,a.updated_at FROM assets a JOIN workspace_members m ON m.workspace_id=a.workspace_id WHERE a.id=$1 AND a.tenant_id=$2 AND m.subject_id=$3",
@@ -262,6 +311,28 @@ export class PostgresJobRepository implements JobStore, WebhookEventStore, Asset
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
+  }
+
+  async findAssetsBySourceJob(auth: AuthContext, jobId: string): Promise<Asset[]> {
+    const result = await this.q(
+      "SELECT a.id,a.tenant_id,a.workspace_id,a.source_job_id,a.kind,a.status,a.storage_bucket,a.storage_key,a.sha256,a.mime_type,a.byte_size,a.created_at,a.updated_at FROM assets a JOIN workspace_members m ON m.workspace_id=a.workspace_id WHERE a.source_job_id=$1 AND a.tenant_id=$2 AND m.subject_id=$3 ORDER BY a.created_at,a.id",
+      [jobId, auth.tenantId, auth.subjectId],
+    );
+    return result.rows.map(row => ({
+      id: row.id,
+      tenantId: row.tenant_id,
+      workspaceId: row.workspace_id,
+      sourceJobId: row.source_job_id ?? undefined,
+      kind: row.kind,
+      status: row.status,
+      storageBucket: row.storage_bucket ?? undefined,
+      storageKey: row.storage_key ?? undefined,
+      sha256: row.sha256 ?? undefined,
+      mimeType: row.mime_type ?? undefined,
+      byteSize: row.byte_size == null ? undefined : Number(row.byte_size),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
   }
 
   async completeUploadSession(
@@ -334,5 +405,161 @@ export class PostgresJobRepository implements JobStore, WebhookEventStore, Asset
         ],
       );
     });
+  }
+}
+
+export class PostgresQuoteRepository implements QuoteStore {
+  constructor(private readonly pool: Pool, private readonly client?: PoolClient) {}
+
+  private q(sql: string, values: unknown[] = []) {
+    return (this.client ?? this.pool).query(sql, values);
+  }
+
+  async transaction<T>(fn: (store: QuoteStore) => T | Promise<T>): Promise<T> {
+    if (this.client) return fn(this);
+    const client = await this.pool.connect();
+    const transactionalStore = new PostgresQuoteRepository(this.pool, client);
+    try {
+      await client.query("BEGIN");
+      const value = await fn(transactionalStore);
+      await client.query("COMMIT");
+      return value;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async authorize(auth: AuthContext, workspaceId?: string): Promise<Workspace> {
+    const result = await this.q(
+      "SELECT w.id,w.tenant_id,w.name,w.status FROM workspaces w JOIN workspace_members m ON m.workspace_id=w.id WHERE w.id=$1 AND w.tenant_id=$2 AND m.subject_id=$3 AND w.status='active'",
+      [workspaceId ?? auth.defaultWorkspaceId, auth.tenantId, auth.subjectId],
+    );
+    if (!result.rowCount) throw new DomainError("NOT_FOUND", "Resource not found");
+    const row = result.rows[0];
+    return { id: row.id, tenantId: row.tenant_id, name: row.name, status: row.status };
+  }
+
+  async findIdempotency(auth: AuthContext, tool: string, key: string): Promise<IdempotencyRecord | undefined> {
+    const result = await this.q(
+      "SELECT id,tenant_id,subject_id,tool_name,idempotency_key,request_hash,response_snapshot_json,resource_type,resource_id,created_at FROM idempotency_records WHERE tenant_id=$1 AND subject_id=$2 AND tool_name=$3 AND idempotency_key=$4",
+      [auth.tenantId, auth.subjectId, tool, key],
+    );
+    if (!result.rowCount) return undefined;
+    const row = result.rows[0];
+    return {
+      id: row.id,
+      tenantId: row.tenant_id,
+      subjectId: row.subject_id,
+      toolName: row.tool_name,
+      idempotencyKey: row.idempotency_key,
+      requestHash: row.request_hash,
+      responseSnapshot: row.response_snapshot_json,
+      resourceType: row.resource_type,
+      resourceId: row.resource_id,
+      createdAt: row.created_at,
+    };
+  }
+
+  async findQuote(auth: AuthContext, quoteId: string): Promise<Quote | undefined> {
+    const result = await this.q(
+      "SELECT q.id,q.tenant_id,q.subject_id,q.workspace_id,q.public_model_id,q.request_hash,q.normalized_request_json,q.pricing_rule_version,q.max_charge_currency,q.max_charge_amount_minor,q.status,q.expires_at,q.created_at,q.updated_at FROM quotes q JOIN workspace_members m ON m.workspace_id=q.workspace_id WHERE q.id=$1 AND q.tenant_id=$2 AND q.subject_id=$3 AND m.subject_id=$3",
+      [quoteId, auth.tenantId, auth.subjectId],
+    );
+    if (!result.rowCount) return undefined;
+    const row = result.rows[0];
+    return {
+      id: row.id,
+      tenantId: row.tenant_id,
+      subjectId: row.subject_id,
+      workspaceId: row.workspace_id,
+      publicModelId: row.public_model_id,
+      requestHash: row.request_hash,
+      normalizedRequest: row.normalized_request_json,
+      pricingRuleVersion: row.pricing_rule_version,
+      maxChargeCurrency: row.max_charge_currency,
+      maxChargeAmountMinor: Number(row.max_charge_amount_minor),
+      status: row.status,
+      expiresAt: row.expires_at,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  async persistQuote(quote: Quote, record: IdempotencyRecord): Promise<IdempotencyRecord | undefined> {
+    await this.q(
+      "INSERT INTO idempotency_records(id,tenant_id,subject_id,tool_name,idempotency_key,request_hash,response_snapshot_json,resource_type,resource_id,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (tenant_id,subject_id,tool_name,idempotency_key) DO NOTHING",
+      [record.id, record.tenantId, record.subjectId, record.toolName, record.idempotencyKey, record.requestHash, record.responseSnapshot, record.resourceType, record.resourceId, record.createdAt],
+    );
+    const persisted = await this.findIdempotency(
+      { tenantId: record.tenantId, subjectId: record.subjectId, clientId: "internal", scopes: [] },
+      record.toolName,
+      record.idempotencyKey,
+    );
+    if (!persisted) throw new DomainError("INTERNAL_ERROR", "Quote idempotency record could not be persisted");
+    if (persisted.id !== record.id) return persisted;
+    await this.q(
+      "INSERT INTO quotes(id,tenant_id,subject_id,workspace_id,public_model_id,request_hash,normalized_request_json,pricing_rule_version,max_charge_currency,max_charge_amount_minor,status,expires_at,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+      [quote.id, quote.tenantId, quote.subjectId, quote.workspaceId, quote.publicModelId, quote.requestHash, quote.normalizedRequest, quote.pricingRuleVersion, quote.maxChargeCurrency, quote.maxChargeAmountMinor, quote.status, quote.expiresAt, quote.createdAt, quote.updatedAt],
+    );
+    return undefined;
+  }
+
+  async updateQuote(quote: Quote): Promise<void> {
+    const result = await this.q(
+      "UPDATE quotes SET status=$1,updated_at=$2 WHERE id=$3 AND tenant_id=$4 AND subject_id=$5 AND workspace_id=$6",
+      [quote.status, quote.updatedAt, quote.id, quote.tenantId, quote.subjectId, quote.workspaceId],
+    );
+    if (!result.rowCount) throw new DomainError("NOT_FOUND", "Resource not found");
+  }
+}
+
+export class PostgresModelCatalogRepository implements ModelCatalogReader {
+  constructor(private readonly pool: Pool) {}
+
+  private map(row: Record<string, any>): ModelCatalogEntry {
+    return {
+      id: row.id,
+      publicModelId: row.public_model_id,
+      version: row.version,
+      providerId: row.provider_id,
+      providerModelId: row.provider_model_id,
+      capability: row.capability,
+      inputSchema: row.input_schema_json,
+      pricingRuleVersion: row.pricing_rule_version,
+      availability: row.availability,
+      limits: row.limits_json ?? {},
+      features: row.features_json,
+    };
+  }
+
+  async list(input: {
+    capability?: "image_generation" | "video_generation";
+    limit?: number;
+  } = {}): Promise<ModelCatalogEntry[]> {
+    const limit = Math.min(Math.max(input.limit ?? 50, 1), 100);
+    const values: unknown[] = [];
+    let where = "capability IN ('image_generation','video_generation')";
+    if (input.capability) {
+      values.push(input.capability);
+      where += ` AND capability=$${values.length}`;
+    }
+    values.push(limit);
+    const result = await this.pool.query(
+      `SELECT id,public_model_id,version,provider_id,provider_model_id,capability,input_schema_json,pricing_rule_version,availability,features_json,limits_json FROM model_catalog WHERE ${where} ORDER BY public_model_id,version DESC LIMIT $${values.length}`,
+      values,
+    );
+    return result.rows.map(row => this.map(row));
+  }
+
+  async get(publicModelId: string): Promise<ModelCatalogEntry> {
+    const result = await this.pool.query(
+      "SELECT id,public_model_id,version,provider_id,provider_model_id,capability,input_schema_json,pricing_rule_version,availability,features_json,limits_json FROM model_catalog WHERE public_model_id=$1 AND capability IN ('image_generation','video_generation') ORDER BY version DESC LIMIT 1",
+      [publicModelId],
+    );
+    if (!result.rowCount) throw new DomainError("NOT_FOUND", "Resource not found");
+    return this.map(result.rows[0]);
   }
 }
